@@ -4,17 +4,17 @@ import ar.edu.austral.inf.sd.server.api.PlayApiService
 import ar.edu.austral.inf.sd.server.api.RegisterNodeApiService
 import ar.edu.austral.inf.sd.server.api.RelayApiService
 import ar.edu.austral.inf.sd.server.api.BadRequestException
-import ar.edu.austral.inf.sd.server.model.PlayResponse
-import ar.edu.austral.inf.sd.server.model.RegisterResponse
-import ar.edu.austral.inf.sd.server.model.Signature
-import ar.edu.austral.inf.sd.server.model.Signatures
+import ar.edu.austral.inf.sd.server.model.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.http.MediaType
 import org.springframework.stereotype.Component
 import org.springframework.web.context.request.RequestContextHolder
 import org.springframework.web.context.request.ServletRequestAttributes
+import org.springframework.web.reactive.function.BodyInserters
+import org.springframework.web.reactive.function.client.WebClient
 import java.security.MessageDigest
 import java.util.*
 import java.util.concurrent.CountDownLatch
@@ -53,35 +53,30 @@ class ApiServicesImpl: RegisterNodeApiService, RelayApiService, PlayApiService {
 
         return RegisterResponse(nextNode.nextHost, nextNode.nextPort, uuid, newSalt())
     }
-
     override fun relayMessage(message: String, signatures: Signatures): Signature {
-        val receivedHash = doHash(message.encodeToByteArray(), salt)
-        val receivedContentType = currentRequest.getPart("message")?.contentType ?: "nada"
-        val receivedLength = message.length
+        val signature = clientSign(message, currentRequest.getPart("message")?.contentType ?: "text/plain")
+
         if (nextNode != null) {
-            // Soy un relé. busco el siguiente y lo mando
-            // @ToDo do some work here
+            val newSignatures = signatures.copy(
+                items = signatures.items + signature
+            )
+            sendRelayMessage(message, signature.contentType ?: "text/plain", nextNode!!, newSignatures)
         } else {
-            // me llego algo, no lo tengo que pasar
-            if (currentMessageWaiting.value == null) throw BadRequestException("no waiting message")
+            if (currentMessageWaiting.value == null) throw BadRequestException("No waiting message")
             val current = currentMessageWaiting.getAndUpdate { null }!!
             val response = current.copy(
-                contentResult = if (receivedHash == current.originalHash) "Success" else "Failure",
-                receivedHash = receivedHash,
-                receivedLength = receivedLength,
-                receivedContentType = receivedContentType,
-                signatures = signatures
+                contentResult = if (signature.hash == current.originalHash) "Success" else "Failure",
+                receivedHash = signature.hash,
+                receivedLength = signature.contentLength ?: message.length,
+                receivedContentType = signature.contentType ?: "text/plain",
+                signatures = signatures.copy(items = signatures.items + signature)
             )
             currentMessageResponse.update { response }
             resultReady.countDown()
         }
-        return Signature(
-            name = myServerName,
-            hash = receivedHash,
-            contentType = receivedContentType,
-            contentLength = receivedLength
-        )
+        return signature
     }
+
 
     override fun sendMessage(body: String): PlayResponse {
         if (nodes.isEmpty()) {
@@ -98,15 +93,32 @@ class ApiServicesImpl: RegisterNodeApiService, RelayApiService, PlayApiService {
     }
 
     internal fun registerToServer(registerHost: String, registerPort: Int) {
-        // @ToDo acá tienen que trabajar ustedes
-        val registerNodeResponse: RegisterResponse = RegisterResponse("", -1, "", "")
-        println("nextNode = ${registerNodeResponse}")
-        nextNode = with(registerNodeResponse) { RegisterResponse(nextHost, nextPort, uuid, hash) }
+        val client = WebClient.create("http://$registerHost:$registerPort")
+        val registerRequest = RegisterRequest(host = myServerName, port = myServerPort, name = "IEstevo")
+        val registerNodeResponse = client.post()
+            .uri("/register")
+            .bodyValue(registerRequest)
+            .retrieve()
+            .bodyToMono(RegisterResponse::class.java)
+            .block() ?: throw RuntimeException("Error registrando el nodo")
+
+        nextNode = registerNodeResponse
     }
 
     private fun sendRelayMessage(body: String, contentType: String, relayNode: RegisterResponse, signatures: Signatures) {
-        // @ToDo acá tienen que trabajar ustedes
+        val client = WebClient.create("http://${relayNode.nextHost}:${relayNode.nextPort}")
+        val response = client.post()
+            .uri("/relay")
+            .contentType(MediaType.MULTIPART_FORM_DATA)
+            .body(
+                BodyInserters.fromMultipartData("message", body)
+                    .with("signatures", signatures))
+            .retrieve()
+            .bodyToMono(Signature::class.java)
+            .block() ?: throw RuntimeException("Error enviando el mensaje al siguiente nodo")
     }
+
+
 
     private fun clientSign(message: String, contentType: String): Signature {
         val receivedHash = doHash(message.encodeToByteArray(), salt)

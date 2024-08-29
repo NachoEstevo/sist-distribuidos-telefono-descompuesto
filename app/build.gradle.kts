@@ -46,6 +46,10 @@ dependencies {
 
     testImplementation("io.kotlintest:kotlintest-runner-junit5:3.4.2")
 
+    implementation("org.springframework.boot:spring-boot-starter-webflux")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-reactor")
+
+
 }
 
 // Apply a specific Java toolchain to ease working on different environments.
